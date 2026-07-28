@@ -1,0 +1,222 @@
+# nixluks
+
+**Declare which LUKS2 volumes a host unlocks post-boot, in what order, with
+header-backup orchestration and drift verification wired to the same
+declaration — one passphrase prompt for the whole set, and a passphrase this
+module never once holds.**
+
+## What nixluks is
+
+Every host with more than one encrypted volume ends up hand-rolling the same
+three things: a `crypttab` (or worse, a shell script) that opens them in the
+right order so systemd's own kernel-keyring cache actually gets to reuse one
+passphrase across all of them; a `cryptsetup luksHeaderBackup` nobody
+remembers to run again after a key rotation; and no way to notice that a
+keyslot got added by hand, or that a rotation only half-happened, until a
+recovery is already underway. nixluks is the declared, generalised version of
+the first of these three things — a mechanism that already existed,
+field-proven, in the sibling
+[nixnas](https://github.com/julian-corbet/nixnas-corbet-ch) project's own
+appliance-specific storage-unlock code — plus the two that never existed
+anywhere in this fleet before this repo.
+
+**The mechanism, in one sentence**: each declared volume opens SERIALLY via
+`systemd-cryptsetup@<name>.service` (systemd's own crypttab-generator units,
+in a fixed order this module declares — `volumes.<name>.order` — never left
+to Nix's own non-deterministic attribute order); the FIRST passphrase entered
+is cached in the kernel keyring and opens every later volume silently — one
+prompt for the whole set. This is systemd's own password cache, not anything
+this module implements; the chain exists only to guarantee the order is
+fixed and repeatable, which is what keeps the cache reliably warm.
+Serialisation is load-bearing — parallel opens would each prompt
+independently — so this module never parallelises the chain.
+
+## The security model
+
+**This module never touches key material. It cannot leak a passphrase
+because it never has one.** The passphrase exists in exactly three places,
+ever: the operator's head; the LUKS header on disk, as a KDF-wrapped master
+key; and the kernel keyring, transiently, for the duration of the unlock
+chain. It is NEVER the Nix store, NEVER a rendered config, NEVER committed to
+git, NEVER a keyfile, and NEVER an environment variable.
+
+What IS declared is deliberately all non-secret, public metadata about the
+ciphertext: which devices are LUKS2 (by UUID or by-id — never a bare
+`/dev/sdX`, kernel enumeration order is not stable), the mapper name each
+opens as, the unlock ORDER, the unlock POLICY as a stance rather than a
+credential (`raiseMode` — see "Hot mode" below), header-backup DESTINATIONS,
+and the EXPECTED header shape (slot count, cipher, KDF) — public metadata
+`cryptsetup luksDump` already reports without a passphrase, checked here only
+so a live drift from the declaration is caught.
+
+**The safety invariant**: nixluks only OPENS declared volumes and READS BACK
+their headers. It never creates, `luksFormat`s, or destroys a device. This is
+not just a comment to trust — `checks/default.nix`'s own
+`structurally-safe` test reads the module's actual source text and fails the
+build if a destructive/creating cryptsetup or filesystem call (`luksFormat`,
+`luksAddKey`, `wipefs`, `mkfs.`, …) ever appears in its real code, comments
+excluded.
+
+**Header backups are sensitive.** A LUKS header backup is not the
+passphrase, but it IS the KDF-wrapped master key plus every keyslot — with
+the passphrase, it opens the volume exactly as completely as the original
+would. `headerBackup.destination` refuses to build if it resolves under
+`/tmp`, `/var/tmp`, or `/dev/shm`, and `nixluks-backup-headers` itself
+refuses at runtime, before writing a single byte, if the destination
+directory grants group/other access.
+
+## Hot mode
+
+The case a hub-class host needs and a rescue image does not:
+`raiseMode = "preopened"` means something upstream of this module — an
+initrd unlock (see [nixboot](https://github.com/julian-corbet/nixboot-corbet-ch)'s
+own `remoteUnlock`) or an operator's earlier manual `cryptsetup open` — has
+ALREADY opened every declared volume by the time stage-2 starts. In that
+mode `nixluks-storage.target` auto-raises at boot but depends on NOTHING —
+re-running an open against an already-open mapper is at best a no-op and at
+worst a second prompt for a passphrase already consumed. The default,
+`raiseMode = "cold"`, is the opposite: every volume is genuinely locked when
+stage-2 starts, and `nixluks-unlock` raises the target on demand.
+
+## Boundaries — one knob, one owner
+
+- **vs [nixboot](https://github.com/julian-corbet/nixboot-corbet-ch)**:
+  nixboot owns unlocking IN THE INITRD to reach switch-root (its own
+  `remoteUnlock` already does initrd-SSH + TPM2). nixluks owns everything
+  unlocked AFTER stage-2 starts; a volume nixboot's initrd already opened is
+  declared here with `raiseMode = "preopened"`, never re-opened.
+- **vs nixstorage**: nixstorage declares the medium's geometry — partitions,
+  sizes, which region plays which role. nixluks declares the CRYPTO LAYER on
+  a region nixstorage already named. Geometry → crypto → filesystem, three
+  separate declarations, never one module doing all three.
+- **vs [nixvault](https://github.com/julian-corbet/nixvault-corbet-ch)**:
+  nixvault owns what goes INSIDE a vault, and how its contents are staged and
+  committed. nixluks owns the KEYING — a vault is not a special case this
+  module needs to know about, it is just another member of `volumes`, keyed
+  and unlocked the same as any other declared disk. A mounted vault is also
+  exactly the kind of place `headerBackup.destination` belongs: private,
+  already encrypted, already part of the same recovery story.
+
+## Two backends, one file
+
+`nixosModules.default` and `systemManagerModules.default` are the same file,
+unchanged — nixluks only ever touches option surface system-manager supports
+identically to NixOS (`environment.etc`, `systemd.services`/`systemd.targets`
+including `overrideStrategy = "asDropin"`, `assertions`/`warnings`,
+`environment.systemPackages`), confirmed by reading system-manager's own
+module source rather than assumed. It never needed `boot.*` or `users.*` in
+the first place — the initrd is nixboot's domain, not this module's, and
+every `nixluks-*` tool runs as whoever invokes it. See
+`modules/nixluks.nix`'s own "ONE FILE, BOTH BACKENDS" header for the full
+accounting, and `checks/default.nix`'s backend-parity tests for the CI proof
+that both backends actually agree.
+
+```nix
+# On a foreign (non-NixOS) host applying its config via system-manager:
+imports = [ inputs.nixluks.systemManagerModules.default ];
+```
+
+## Usage
+
+```nix
+{
+  inputs.nixluks.url = "github:julian-corbet/nixluks-corbet-ch";
+
+  outputs = { self, nixpkgs, nixluks, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        nixluks.nixosModules.default
+
+        {
+          nixluks = {
+            enable = true;
+            raiseMode = "cold"; # or "preopened" -- see "Hot mode" above
+
+            volumes = {
+              archive0 = {
+                device = "/dev/disk/by-id/ata-…"; # this exact disk, never /dev/sdX
+                order = 1; # opens first; its passphrase primes the keyring cache
+                role = "primary data pool";
+                headerBackup.destination = "/mnt/vault/luksHeaderBackups/archive0.img";
+                expect = {
+                  cipher = "aes-xts-plain64";
+                  slotCount = 1;
+                  kdf = "argon2id";
+                };
+              };
+              archive1 = {
+                device = "/dev/disk/by-uuid/…"; # or the LUKS container's own UUID
+                order = 2; # opens silently, from the cached passphrase above
+              };
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Then, on that host:
+
+```console
+$ sudo nixluks-unlock            # one passphrase, every declared volume opens
+$ sudo nixluks-backup-headers    # copies each declared header to its destination
+$ sudo nixluks-verify            # compares live headers against the declaration
+```
+
+Downstream mounts are native NixOS/system-manager, not this module's job —
+gate a `fileSystems` entry on the same target nixnas's own precedent already
+documents:
+
+```nix
+fileSystems."/data" = {
+  device = "/dev/mapper/archive0";
+  options = [ "noauto" "x-systemd.wanted-by=nixluks-storage.target" ];
+};
+```
+
+## Status
+
+The module and its three tools are complete, exported for both NixOS and
+system-manager, and covered by eval-time tests (including backend parity and
+a mechanical check that the module's own code contains no
+destructive/creating cryptsetup call) plus a real `pkgs.testers.nixosTest`
+runtime harness (`checks/lifecycle-vm-test.nix`) that opens two real LUKS2
+volumes from one passphrase prompt, proves the second opens from the kernel
+keyring cache with no second prompt, proves a wrong passphrase fails cleanly,
+proves `nixluks-verify` catches a hand-added keyslot with a different KDF,
+and proves a header backup is a real, independently readable LUKS2 header.
+
+## Repository layout
+
+| Path | Purpose |
+|---|---|
+| `flake.nix` | Flake entry point: `nixosModules.default` / `systemManagerModules.default` (the same file, both backends), and `lib.devicePathType`. |
+| `modules/nixluks.nix` | The module: options, assertions, the serial unlock chain, and the three tools. |
+| `lib/device-path.nix` | The by-id/by-uuid device type, exposed so a consumer can validate a device string without a full eval. |
+| `checks/` | Eval-time tests (including backend parity and the structurally-safe check) plus the real `pkgs.testers.nixosTest` lifecycle harness, all wired into `nix flake check`. |
+| `docs/index.md` | The design walkthrough: the serial chain in detail, the ask-password protocol the VM test drives, and why `order` is explicit rather than name-derived. |
+| `experiments/` | Runnable trials with recorded results — see [`experiments/README.md`](experiments/README.md). |
+| `studies/` | Written investigations that motivate design decisions — see [`studies/README.md`](studies/README.md). |
+
+## Related projects
+
+Part of the same small, independently-usable NixOS module family:
+[nixnas](https://github.com/julian-corbet/nixnas-corbet-ch) (the field-proven
+serial-unlock-with-keyring-cache mechanism this module generalises out of its
+`modules/storage/connect.nix`), [nixvault](https://github.com/julian-corbet/nixvault-corbet-ch)
+(the VM-test pattern this project's own `checks/lifecycle-vm-test.nix`
+copies, and the module this repo's own vault-as-a-chain-member boundary
+refers to), [nixfs](https://github.com/julian-corbet/nixfs-corbet-ch) (the
+"one file, both backends" export shape this project's dual-backend export
+copies), and [nixboot](https://github.com/julian-corbet/nixboot-corbet-ch)
+(the prose-option, one-knob-one-owner house style, and the initrd-side unlock
+`raiseMode = "preopened"` composes with). nixluks has no build-time dependency
+on any of them — it is built to sit on any host, independent of whatever
+boot stance or vault that host uses.
+
+## License
+
+[MIT License](LICENSE) &copy; 2026 Julian Corbet
