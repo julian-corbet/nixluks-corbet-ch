@@ -157,6 +157,15 @@ let
 
   devicePathType = import ../lib/device-path.nix { inherit lib; };
 
+  # ── nixstorage.disks: read defensively, exactly as nixstorage itself reads nixid
+  # (modules/reconciler.nix: `config.nixid.posix.identities or { }`) and as nixboot reads
+  # nixstorage's own layout (`config.nixstorage.layout.images or { }`). nixluks never imports
+  # nixstorage and never will -- see this file's own SCOPE section: geometry is nixstorage's
+  # domain, the crypto layer on top of a region nixstorage already named is this module's. This
+  # is a NAME LOOKUP, not a dependency: absent nixstorage entirely, `nsDisks` is just `{ }` and
+  # every volume falls back to typing `device` by hand, exactly as nixluks has always worked.
+  nsDisks = config.nixstorage.disks or { };
+
   volNames = attrNames cfg.volumes;
 
   # Deterministic unlock order: `order` (an explicit int, never attribute-definition order, which
@@ -350,9 +359,50 @@ let
     text = verifyScript;
   };
 
-  volumeModule = { name, ... }: {
+  volumeModule = { name, config, ... }:
+    let
+      # Resolved once, here, so the `device` default below and the "unknown name" assertion in
+      # the top-level `assertions` list agree on exactly the same lookup. Deliberately NOT a
+      # fallback to some placeholder when the name is missing from the table -- see `fromDisk`'s
+      # own description for why that must be a loud, named failure rather than a quiet null.
+      resolvedDevice =
+        if config.fromDisk == null then null
+        else if nsDisks ? ${config.fromDisk} then nsDisks.${config.fromDisk}.device
+        else null;
+    in {
     options = {
-      device = mkOption {
+      fromDisk = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "primary-pool-disk0";
+        description = ''
+          Name of an entry in `nixstorage.disks` (this host's physical-disk table -- see that
+          repo's own modules/disks.nix) naming the device this LUKS container actually lives on.
+          When set, `device` DEFAULTS to that entry's `.device` path instead of the same by-id/
+          by-uuid string being typed a second time in this module.
+
+          THE INCIDENT THIS CLOSES: nixstorage's own disks.nix header documents that
+          `nixluks.volumes.<name>.device` was one of THREE independent places typing the same
+          physical disk's by-id string with nothing asserting they agreed -- `nixstorage.layout`
+          (which WRITES PARTITION TABLES), this option, and nixvault's own device fields. A
+          drifted string here means an unlock declaration and a layout run disagree about which
+          disk is which -- and the drift does not even need a typo to happen: on 2026-07-29 a
+          reboot alone moved a rescue stick from sdr to sdq while an unrelated blank 239 GiB
+          drive took over sdr, so a perfectly correct by-id string typed once can go stale the
+          moment a disk is re-seated. `nixstorage.disks` is the one place that gets corrected
+          when that happens; naming it here means this volume inherits the fix for free instead
+          of needing its own separate edit.
+
+          Leave null to type `device` directly, exactly as nixluks has always worked -- a host
+          that carves its own medium, or has no `nixstorage` import at all, is unaffected.
+          nixluks never imports nixstorage and reads it defensively
+          (`config.nixstorage.disks or { }`), so this is inert if nixstorage is absent. Setting
+          `device` explicitly always wins over whatever `fromDisk` would have resolved to -- this
+          option only ever supplies a DEFAULT, never a forced value.
+        '';
+      };
+
+      device = mkOption ({
         type = devicePathType;
         example = literalExpression ''"/dev/disk/by-uuid/f47ac10b-58cc-4372-a567-0e02b2c3d479"'';
         description = ''
@@ -361,8 +411,17 @@ let
           ciphertext even onto a different physical disk). NEVER a bare `/dev/sdX` or
           `/dev/nvme0n1pN` -- kernel enumeration order is not guaranteed stable across a reboot.
           Opens at `/dev/mapper/${name}` (the attribute name IS the mapper name).
+
+          Required unless `fromDisk` names a `nixstorage.disks` entry -- see that option. There
+          is deliberately NO fallback default when neither is given: a LUKS volume nixluks does
+          not know how to reach is a configuration error to catch at build time, never a value
+          to guess at.
         '';
-      };
+      } // lib.optionalAttrs (resolvedDevice != null) {
+        default = resolvedDevice;
+        defaultText = literalExpression
+          "nixstorage.disks.<fromDisk>.device, resolved via this volume's own fromDisk";
+      });
       order = mkOption {
         type = types.int;
         example = 10;
@@ -564,7 +623,43 @@ in
                 message = ''nixluks.volumes: ${concatStringsSep ", " (map (n: "\"${n}\" (order ${toString cfg.volumes.${n}.order})") dup)} share an `order` value -- the serial unlock chain needs a single unambiguous sequence. Give each a distinct `order`.'';
               }])
         ++ (let
-              devDups = lib.filter (n: lib.length (lib.filter (m: cfg.volumes.${m}.device == cfg.volumes.${n}.device) volNames) > 1) volNames;
+              # `fromDisk` names an entry in a TABLE this module never controls -- a typo, a disk
+              # retired from `nixstorage.disks`, or nixstorage simply not being imported on this
+              # host must all be a clear, named failure, never a silent `null` quietly leaving
+              # `device` required-but-unset with no hint why. See `fromDisk`'s own description
+              # for the incident this whole lookup exists to close.
+              namesWithFromDisk = lib.filter (n: cfg.volumes.${n}.fromDisk != null) volNames;
+              missing = lib.filter (n: !(nsDisks ? ${cfg.volumes.${n}.fromDisk})) namesWithFromDisk;
+              knownDisks =
+                if nsDisks == { }
+                then "(none -- nixstorage.disks is empty or nixstorage was never imported on this host)"
+                else concatStringsSep ", " (attrNames nsDisks);
+            in
+              map
+                (n: {
+                  assertion = false;
+                  message = ''nixluks.volumes."${n}".fromDisk = "${cfg.volumes.${n}.fromDisk}" names an entry that does not exist in nixstorage.disks. Known disks: ${knownDisks}. Fix the name, or set volumes."${n}".device directly instead of using fromDisk.'';
+                })
+                missing)
+        ++ (let
+              # Read `.device` through `tryEval` here ONLY: a volume whose device is genuinely
+              # unresolved (unset, or `fromDisk` naming a table entry that doesn't exist) must not
+              # crash THIS check merely by being compared to itself. Building the merged
+              # `assertions` list forces every segment's own spine (including this one) before
+              # `checkAssertWarn` ever inspects a single `.assertion` field -- so an uncaught throw
+              # here would surface NixOS's generic "used but not defined" error and mask the much
+              # clearer `fromDisk`-not-found assertion just above it. A volume that fails to
+              # resolve a device is excluded from THIS comparison, not exempted from failing the
+              # build -- the fromDisk assertion (or, absent that, the plain "required option" error
+              # once the build proceeds past assertions) still catches it.
+              safeDevice = n:
+                let r = builtins.tryEval cfg.volumes.${n}.device;
+                in if r.success then r.value else null;
+              devDups = lib.filter
+                (n:
+                  let d = safeDevice n;
+                  in d != null && lib.length (lib.filter (m: safeDevice m == d) volNames) > 1)
+                volNames;
             in
               optionals (devDups != [ ]) [{
                 assertion = false;

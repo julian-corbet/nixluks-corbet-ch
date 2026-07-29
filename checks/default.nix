@@ -21,6 +21,10 @@
 #      never both lists populated for the same host.
 #   5. A destination under /tmp, /var/tmp, or /dev/shm for `headerBackup.destination` is a hard
 #      build failure -- see modules/nixluks.nix's own "HEADER BACKUPS ARE SENSITIVE" section.
+#   5b. `volumes.<name>.fromDisk` resolves `device` from a sibling `nixstorage.disks` table
+#      entry when named and present; an explicitly-typed `device` still wins over it; and a
+#      `fromDisk` naming an entry absent from the table is a hard, clearly-messaged build
+#      failure -- never a silent fall-through to some placeholder device string.
 #   6. `nixluks-backup-headers` is installed ONLY when at least one volume declares a
 #      `headerBackup.destination`; `nixluks-verify` is installed unless `verify.enable = false`;
 #      `nixluks-unlock` is always installed once any volume is declared.
@@ -66,6 +70,55 @@ let
       order = 1;
     };
   };
+
+  # Minimal stand-in for a sibling `nixstorage.disks` table (see modules/nixluks.nix's own
+  # defensive read, `config.nixstorage.disks or { }`) -- declares just enough option surface to
+  # prove the read resolves a real value when present, without pulling in the actual nixstorage
+  # flake as a `checks`-only input (that input would still never be a runtime dependency of the
+  # module itself -- see this repo's flake.nix header for why `nixpkgs`/`system-manager` are
+  # already scoped that way). nixluks NEVER imports nixstorage; this fixture just plays the part
+  # of "a host that happens to also have nixstorage imported", the exact shape nixluks reads.
+  fakeNixstorageDisksModule = {
+    options.nixstorage.disks = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.submodule {
+        options.device = lib.mkOption { type = lib.types.str; };
+      });
+      default = { };
+    };
+  };
+
+  evalNixosWithFakeDisks = extraConfig:
+    (import (nixpkgs + "/nixos/lib/eval-config.nix") {
+      inherit system;
+      modules = [
+        nixluksModule
+        fakeNixstorageDisksModule
+        extraConfig
+        {
+          boot.loader.grub.enable = false;
+          fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
+          system.stateVersion = "25.05";
+        }
+      ];
+    }).config;
+
+  nixosBuildFailsWithFakeDisks = extraConfig:
+    !(builtins.tryEval (builtins.seq (evalNixosWithFakeDisks extraConfig).system.build.toplevel true)).success;
+
+  fromDiskBase = {
+    nixstorage.disks.disk0.device = "/dev/disk/by-id/test-fromdisk-disk0";
+    nixluks.enable = true;
+    nixluks.volumes.primary = {
+      fromDisk = "disk0";
+      order = 1;
+    };
+  };
+
+  cfg-from-disk = evalNixosWithFakeDisks fromDiskBase;
+
+  cfg-from-disk-explicit-device-wins = evalNixosWithFakeDisks (lib.recursiveUpdate fromDiskBase {
+    nixluks.volumes.primary.device = "/dev/disk/by-id/hand-typed-wins";
+  });
 
   cfg-basic = evalNixos validBase;
   cfg-disabled = evalNixos { nixluks.enable = false; };
@@ -201,6 +254,26 @@ let
         };
       })
       "expected two volumes naming the SAME device to fail the build, but it succeeded")
+
+    # --- 2b2. fromDisk resolves device from a sibling nixstorage.disks table -------------------
+    (check "device/fromDisk-resolves-from-nixstorage-disks-table"
+      (cfg-from-disk.nixluks.volumes.primary.device == "/dev/disk/by-id/test-fromdisk-disk0")
+      "got device=${builtins.toJSON (cfg-from-disk.nixluks.volumes.primary.device or null)}, expected the fixture's nixstorage.disks.disk0.device value")
+
+    (check "device/fromDisk-explicit-device-still-wins"
+      (cfg-from-disk-explicit-device-wins.nixluks.volumes.primary.device == "/dev/disk/by-id/hand-typed-wins")
+      "an explicitly-typed device must win over whatever fromDisk would have resolved to -- got ${builtins.toJSON (cfg-from-disk-explicit-device-wins.nixluks.volumes.primary.device or null)}")
+
+    (check "device/fromDisk-unknown-name-fails-the-build"
+      (nixosBuildFailsWithFakeDisks {
+        nixstorage.disks.disk0.device = "/dev/disk/by-id/test-fromdisk-disk0";
+        nixluks.enable = true;
+        nixluks.volumes.primary = {
+          fromDisk = "does-not-exist";
+          order = 1;
+        };
+      })
+      "expected fromDisk naming an entry absent from nixstorage.disks to fail the build, but it succeeded")
 
     # --- 2c. an attribute name unsafe as a unit instance / mapper name is a hard failure --------
     (check "name/invalid-characters-fail-the-build"
