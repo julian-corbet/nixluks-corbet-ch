@@ -549,7 +549,15 @@ in
           })
           (lib.filter (n: cfg.volumes.${n}.headerBackup.destination != null) volNames))
         ++ (let
-              dup = lib.filter (n: lib.length (lib.filter (m: cfg.volumes.${m}.order == cfg.volumes.${n}.order) volNames) > 1) volNames;
+              # ONLY volumes this module actually orders. `order` exists to sequence the
+              # serial unlock chain so the kernel-keyring cache is always hit; a volume
+              # with manageUnlock = false contributes no chain edge at all, so its order
+              # is inert and collisions between such volumes are meaningless. Asserting
+              # over them anyway forces a host using nixluks purely for header backups --
+              # the exact case manageUnlock exists for -- to invent 16 distinct numbers
+              # that order nothing.
+              orderedNames = lib.filter (n: cfg.volumes.${n}.manageUnlock) volNames;
+              dup = lib.filter (n: lib.length (lib.filter (m: cfg.volumes.${m}.order == cfg.volumes.${n}.order) orderedNames) > 1) orderedNames;
             in
               optionals (dup != [ ]) [{
                 assertion = false;
