@@ -153,7 +153,7 @@ let
   inherit (lib)
     mkEnableOption mkOption mkIf mkMerge types literalExpression
     concatStringsSep concatMapStringsSep mapAttrsToList listToAttrs nameValuePair
-    imap0 optional optionals optionalString sort filterAttrs attrNames;
+    imap0 optional optionals optionalString sort filter filterAttrs attrNames;
 
   devicePathType = import ../lib/device-path.nix { inherit lib; };
 
@@ -181,8 +181,13 @@ let
   # these on demand (`cold`) or they are simply already open before this unit graph exists
   # (`preopened`). `nofail`: a missing/degraded disk never fails the target -- non-fatal by design,
   # the same stance connect.nix's own crypttab line takes.
+  # ONLY volumes this module actually owns the unlock for. A volume with
+  # manageUnlock = false contributes no crypttab line and no ordering edge -- it is
+  # present purely so header backup and verification can see it.
+  managedNames = filter (n: cfg.volumes.${n}.manageUnlock) sortedNames;
+
   crypttab = concatStringsSep "\n"
-    (map (n: "${n} ${cfg.volumes.${n}.device} none luks,noauto,nofail") sortedNames);
+    (map (n: "${n} ${cfg.volumes.${n}.device} none luks,noauto,nofail") managedNames);
 
   volumesWithBackup = filterAttrs (_: v: v.headerBackup.destination != null) cfg.volumes;
   backupNames = attrNames volumesWithBackup;
@@ -379,6 +384,36 @@ let
           a rescue runbook -- nixluks never branches on this value, it only prints it back.
         '';
       };
+      manageUnlock = mkOption {
+        type = types.bool;
+        default = true;
+        example = false;
+        description = ''
+          Whether nixluks OWNS this volume's unlock: its `/etc/crypttab` line and its
+          place in the serialised `systemd-cryptsetup@` ordering chain.
+
+          Set false to use nixluks for header backup and drift verification ONLY,
+          on a volume whose unlock some other module already owns.
+
+          THIS EXISTS BECAUSE THE ALTERNATIVE FAILS SILENTLY. `environment.etc` is a
+          mergeable `lines` type, so declaring a volume here that another module also
+          declares does NOT produce a build error -- it produces a crypttab with TWO
+          entries for the same mapper name, and two independent `after=` chains racing
+          to open one device. That is "two owners of one fact", and it is precisely
+          what a consolidation onto this module is supposed to eliminate rather than
+          introduce.
+
+          The concrete case: a host whose initrd already unlocks every member from one
+          passphrase (see the HOT MODE section) wants this module's
+          `nixluks-backup-headers` and `nixluks-verify` without a second unlock path.
+          Both of those tools only ever touch the raw `.device` path, never
+          `/dev/mapper/<name>`, so they work perfectly well with `manageUnlock = false`.
+
+          Renaming the mapper to dodge the collision instead is WORSE, not better: it
+          creates a genuinely separate dm-crypt mapping over the same physical device.
+        '';
+      };
+
       headerBackup.destination = mkOption {
         type = types.nullOr types.path;
         default = null;
@@ -466,6 +501,26 @@ in
       '';
     };
 
+    headerBackup.schedule = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "daily";
+      description = ''
+        systemd `OnCalendar=` cadence for running `nixluks-backup-headers` automatically.
+        null (the default) means no timer -- the tool stays a manual CLI.
+
+        SET THIS. A header backup that is only taken when someone remembers is the exact
+        failure this module's own docs name as its motivation ("a header nobody remembers
+        to run again after rotation"), and shipping the mechanism without a trigger fixes
+        the mechanism while leaving the remembering. A header predating a passphrase
+        rotation still LOOKS like a recovery path and is not one.
+
+        Taking a header backup needs NO passphrase -- `cryptsetup luksHeaderBackup` reads
+        the header off the raw device -- so this is genuinely safe to run unattended, and
+        there is no reason for it to be manual.
+      '';
+    };
+
     verify.enable = mkOption {
       type = types.bool;
       default = true;
@@ -520,9 +575,29 @@ in
       systemd.services = listToAttrs (imap0
         (i: n: nameValuePair "systemd-cryptsetup@${n}" {
           overrideStrategy = "asDropin";
-          after = optional (i > 0) (unlockUnitName (lib.elemAt sortedNames (i - 1)));
+          after = optional (i > 0) (unlockUnitName (lib.elemAt managedNames (i - 1)));
         })
-        sortedNames);
+        managedNames)
+      // lib.optionalAttrs (cfg.headerBackup.schedule != null && backupNames != [ ]) {
+        nixluks-backup-headers = {
+          description = "nixluks: back up the LUKS header of every volume declaring a destination";
+          serviceConfig = {
+            Type = "oneshot";
+            ExecStart = "${nixluks-backup-headers}/bin/nixluks-backup-headers";
+          };
+        };
+      };
+
+      # Automatic header backup. Needs no passphrase (luksHeaderBackup reads the raw
+      # header), so unlike anything that OPENS a container this is safe on a timer.
+      systemd.timers.nixluks-backup-headers =
+        mkIf (cfg.headerBackup.schedule != null && backupNames != [ ]) {
+          wantedBy = [ "timers.target" ];
+          timerConfig = {
+            OnCalendar = cfg.headerBackup.schedule;
+            Persistent = true;
+          };
+        };
 
       # The one switch: "cold" pulls in the cryptsetup chain and stays inert until
       # `nixluks-unlock` starts it; "preopened" auto-raises at boot and depends on NOTHING (the
