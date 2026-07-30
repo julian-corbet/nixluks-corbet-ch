@@ -4,7 +4,7 @@
 
 This module is an extraction, not an invention. The serial-unlock-with-
 keyring-cache mechanism is lifted directly from the sibling
-[nixnas](https://github.com/julian-corbet/nixnas-corbet-ch) project's
+[nixnas](https://github.com/julian-corbet/nixnas) project's
 `modules/storage/connect.nix` (`storage.unlock`), which has run in
 production against real disks. What follows restates that design in
 host-agnostic terms.
@@ -38,7 +38,7 @@ vault, where a volume's most natural name (a role: `vault`, `primary`,
 nixluks makes `order` its own field for exactly this reason: naming and
 sequencing are different concerns, and forcing one to encode the other is
 the kind of coupling this whole family of modules tries not to introduce
-(see nixstorage's own `nixid`/`nixstorage` split for the same argument made
+(see nixstorage's own `nixiam`/`nixstorage` split for the same argument made
 about identity and storage shape). The determinism connect.nix's own header
 calls load-bearing is preserved exactly — `order` with the volume name as a
 tie-break is still a total, repeatable ordering, just sourced from a field

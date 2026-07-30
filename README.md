@@ -16,7 +16,7 @@ keyslot got added by hand, or that a rotation only half-happened, until a
 recovery is already underway. nixluks is the declared, generalised version of
 the first of these three things — a mechanism that already existed,
 field-proven, in the sibling
-[nixnas](https://github.com/julian-corbet/nixnas-corbet-ch) project's own
+[nixnas](https://github.com/julian-corbet/nixnas) project's own
 appliance-specific storage-unlock code — plus the two that never existed
 anywhere before this repo.
 
@@ -204,7 +204,7 @@ and proves a header backup is a real, independently readable LUKS2 header.
 ## Related projects
 
 Part of the same small, independently-usable NixOS module family:
-[nixnas](https://github.com/julian-corbet/nixnas-corbet-ch) (the field-proven
+[nixnas](https://github.com/julian-corbet/nixnas) (the field-proven
 serial-unlock-with-keyring-cache mechanism this module generalises out of its
 `modules/storage/connect.nix`), [nixvault](https://github.com/julian-corbet/nixvault-corbet-ch)
 (the VM-test pattern this project's own `checks/lifecycle-vm-test.nix`

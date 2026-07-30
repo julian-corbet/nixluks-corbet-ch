@@ -157,8 +157,8 @@ let
 
   devicePathType = import ../lib/device-path.nix { inherit lib; };
 
-  # ── nixstorage.disks: read defensively, exactly as nixstorage itself reads nixid
-  # (modules/reconciler.nix: `config.nixid.posix.identities or { }`) and as nixboot reads
+  # ── nixstorage.disks: read defensively, exactly as nixstorage itself reads nixiam
+  # (modules/reconciler.nix: `config.nixiam.posix.identities or { }`) and as nixboot reads
   # nixstorage's own layout (`config.nixstorage.layout.images or { }`). nixluks never imports
   # nixstorage and never will -- see this file's own SCOPE section: geometry is nixstorage's
   # domain, the crypto layer on top of a region nixstorage already named is this module's. This
