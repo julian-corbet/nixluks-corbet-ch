@@ -66,10 +66,12 @@ passphrase.
 
 ## Hot mode, and why it is a single two-value stance
 
-`raiseMode` answers one question — has something upstream of this module
-already opened every declared volume by the time stage-2 starts? — never a
-richer per-volume policy, because the underlying reality it describes is
-whole-host, not per-volume: an initrd unlock (nixboot's own `remoteUnlock`)
+`raiseMode` answers one question — has every declared volume already been
+opened by the time stage-2 starts? — never a richer per-volume policy,
+because the underlying reality it describes is whole-host, not per-volume:
+an initrd unlock (this repo's own `modules/initrd.nix`,
+`volumes.<name>.initrdUnlock.*` — a distinct mechanism from nixboot's
+`remoteUnlock`, which guards the initrd-SSH host key, not a LUKS member)
 either ran against the whole set the initrd knew about, or it didn't; there
 is no scenario where half a host's declared volumes arrive pre-opened and
 half do not, without that already being two different hosts' worth of

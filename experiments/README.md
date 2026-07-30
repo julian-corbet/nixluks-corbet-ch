@@ -16,7 +16,9 @@ No experiments have been run yet. Candidates:
   number of declared volumes grows (each `systemd-cryptsetup@` unit adds one
   `After=` hop) -- the mechanism is documented as fine for a handful of
   volumes; nothing here has measured where "a handful" stops being true.
-- A trial of `raiseMode = "preopened"` against a real nixboot `remoteUnlock`
-  initrd, to confirm the initrd's own opened mappers really do satisfy
-  `nixluks-storage.target` with zero re-open attempts on a real boot, not
-  just in `checks/default.nix`'s eval-level rendering of that mode.
+- A trial of `raiseMode = "preopened"` against a real initrd that opened
+  volumes via this repo's own `modules/initrd.nix`
+  (`volumes.<name>.initrdUnlock.enable`), to confirm the initrd's own opened
+  mappers really do satisfy `nixluks-storage.target` with zero re-open
+  attempts on a real boot, not just in `checks/default.nix`'s eval-level
+  rendering of that mode.

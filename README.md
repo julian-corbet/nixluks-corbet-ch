@@ -68,23 +68,31 @@ directory grants group/other access.
 ## Hot mode
 
 The case a hub-class host needs and a rescue image does not:
-`raiseMode = "preopened"` means something upstream of this module — an
-initrd unlock (see [nixboot](https://github.com/julian-corbet/nixboot-corbet-ch)'s
-own `remoteUnlock`) or an operator's earlier manual `cryptsetup open` — has
-ALREADY opened every declared volume by the time stage-2 starts. In that
-mode `nixluks-storage.target` auto-raises at boot but depends on NOTHING —
-re-running an open against an already-open mapper is at best a no-op and at
-worst a second prompt for a passphrase already consumed. The default,
-`raiseMode = "cold"`, is the opposite: every volume is genuinely locked when
-stage-2 starts, and `nixluks-unlock` raises the target on demand.
+`raiseMode = "preopened"` means every declared volume is ALREADY open by the
+time stage-2 starts — either this repo's own `modules/initrd.nix` opened it
+one stage earlier (`volumes.<name>.initrdUnlock.enable`; see "Boundaries"
+below), or something else did (an operator's earlier manual `cryptsetup
+open`). In that mode `nixluks-storage.target` auto-raises at boot but
+depends on NOTHING — re-running an open against an already-open mapper is at
+best a no-op and at worst a second prompt for a passphrase already consumed.
+The default, `raiseMode = "cold"`, is the opposite: every volume is
+genuinely locked when stage-2 starts, and `nixluks-unlock` raises the target
+on demand.
 
 ## Boundaries — one knob, one owner
 
 - **vs [nixboot](https://github.com/julian-corbet/nixboot-corbet-ch)**:
-  nixboot owns unlocking IN THE INITRD to reach switch-root (its own
-  `remoteUnlock` already does initrd-SSH + TPM2). nixluks owns everything
-  unlocked AFTER stage-2 starts; a volume nixboot's initrd already opened is
-  declared here with `raiseMode = "preopened"`, never re-opened.
+  nixboot's own `remoteUnlock` guards a DIFFERENT secret over a DIFFERENT
+  channel — the TPM2-sealed initrd-SSH host key that lets an operator type a
+  passphrase in remotely. It never declares, opens, or times out a LUKS
+  member (nixboot has no member list to attach that to). Actually OPENING a
+  declared volume in the initrd, one stage before switch-root, is
+  `modules/initrd.nix` — a separate NixOS-only module this flake also
+  exports (`volumes.<name>.initrdUnlock.{enable,critical,timeoutSec}`);
+  system-manager has no `boot.initrd.*` surface at all, so it can never
+  carry this (see "Two backends, one file" below). A volume that module
+  already opened is declared here with `raiseMode = "preopened"`, never
+  re-opened by the post-boot chain.
 - **vs nixstorage**: nixstorage declares the medium's geometry — partitions,
   sizes, which region plays which role. nixluks declares the CRYPTO LAYER on
   a region nixstorage already named. Geometry → crypto → filesystem, three
@@ -99,17 +107,20 @@ stage-2 starts, and `nixluks-unlock` raises the target on demand.
 
 ## Two backends, one file
 
-`nixosModules.default` and `systemManagerModules.default` are the same file,
-unchanged — nixluks only ever touches option surface system-manager supports
-identically to NixOS (`environment.etc`, `systemd.services`/`systemd.targets`
-including `overrideStrategy = "asDropin"`, `assertions`/`warnings`,
-`environment.systemPackages`), confirmed by reading system-manager's own
-module source rather than assumed. It never needed `boot.*` or `users.*` in
-the first place — the initrd is nixboot's domain, not this module's, and
-every `nixluks-*` tool runs as whoever invokes it. See
-`modules/nixluks.nix`'s own "ONE FILE, BOTH BACKENDS" header for the full
-accounting, and `checks/default.nix`'s backend-parity tests for the CI proof
-that both backends actually agree.
+`nixosModules.default` and `systemManagerModules.default` are the same file
+(`modules/nixluks.nix`), unchanged — nixluks only ever touches option surface
+system-manager supports identically to NixOS (`environment.etc`,
+`systemd.services`/`systemd.targets` including `overrideStrategy =
+"asDropin"`, `assertions`/`warnings`, `environment.systemPackages`),
+confirmed by reading system-manager's own module source rather than assumed.
+This ONE file never needed `boot.*` or `users.*` — every `nixluks-*` tool
+runs as whoever invokes it. Actually opening a volume in the initrd
+(`volumes.<name>.initrdUnlock.*`, see "Boundaries" above) is a separate file,
+`modules/initrd.nix` — a NixOS-only `nixosModule` never exported as a
+`systemManagerModule`, because system-manager has no `boot.initrd.*` surface
+at all. See `modules/nixluks.nix`'s own "ONE FILE, BOTH BACKENDS" header for
+the full accounting, and `checks/default.nix`'s backend-parity tests for the
+CI proof that both backends actually agree.
 
 ```nix
 # On a foreign (non-NixOS) host applying its config via system-manager:
@@ -193,8 +204,9 @@ and proves a header backup is a real, independently readable LUKS2 header.
 
 | Path | Purpose |
 |---|---|
-| `flake.nix` | Flake entry point: `nixosModules.default` / `systemManagerModules.default` (the same file, both backends), and `lib.devicePathType`. |
+| `flake.nix` | Flake entry point: `nixosModules.default` / `systemManagerModules.default` (the same file, both backends), the separately-exported `nixosModules.initrd`, and `lib.devicePathType`. |
 | `modules/nixluks.nix` | The module: options, assertions, the serial unlock chain, and the three tools. |
+| `modules/initrd.nix` | NixOS-only `nixosModule` (never a `systemManagerModule`): opens `volumes.<name>.initrdUnlock`-enabled volumes IN THE INITRD, one stage before switch-root. |
 | `lib/device-path.nix` | The by-id/by-uuid device type, exposed so a consumer can validate a device string without a full eval. |
 | `checks/` | Eval-time tests (including backend parity and the structurally-safe check) plus the real `pkgs.testers.nixosTest` lifecycle harness, all wired into `nix flake check`. |
 | `docs/index.md` | The design walkthrough: the serial chain in detail, the ask-password protocol the VM test drives, and why `order` is explicit rather than name-derived. |
