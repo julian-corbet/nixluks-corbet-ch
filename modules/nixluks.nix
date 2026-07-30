@@ -100,10 +100,21 @@
 #           the stance that governs WHEN that unlock happens (`raiseMode`), header-backup
 #           orchestration to a declared destination, and drift verification against the live
 #           header (`nixluks-verify`).
-#   NOT   : unlocking IN THE INITRD to reach switch-root -- that is nixboot's domain (its own
-#           `remoteUnlock` already does initrd-SSH + TPM2). nixluks owns everything unlocked AFTER
-#           stage-2 starts; a volume nixboot's initrd already opened is declared here with
-#           `raiseMode = "preopened"`, never re-opened.
+#   NOT (this file) : actually OPENING a volume in the initrd to reach switch-root. THIS FILE's
+#           own `boot.*` surface is empty ON PURPOSE (see "ONE FILE, BOTH BACKENDS" below --
+#           system-manager has no `boot.initrd.*` at all, so this file can never write it). That
+#           does NOT mean the mechanism lives in nixboot instead: nixboot's own `remoteUnlock` is
+#           a DIFFERENT secret (the initrd-SSH host key, TPM2-sealed) guarding a DIFFERENT channel
+#           (an SSH session to type a passphrase into) -- it never declares, opens, or times out a
+#           LUKS member, and says so itself (nixboot's modules/nixboot.nix, the "CROSS-MODULE
+#           COUPLING nixboot cannot see" comment: "nixboot has no LUKS member list to attach it
+#           to"). The actual mechanism -- the SAME serial-unlock-with-keyring-cache chain this
+#           file runs post-boot, run one stage earlier, with a per-volume boot-critical/non-fatal
+#           timeout split -- is `modules/initrd.nix`, a SEPARATE NixOS-only `nixosModule` this
+#           flake also exports (never part of `systemManagerModules`: see that file's own header).
+#           A volume that module already opened is declared HERE with `raiseMode = "preopened"`
+#           (asserted below: any volume with `initrdUnlock.enable = true` requires it), never
+#           re-opened by this file's own stage-2 chain.
 #   NOT   : the medium's geometry -- partitions, sizes, which region plays which role. That is
 #           nixstorage's domain: nixstorage declares the geometry, nixluks declares the CRYPTO
 #           LAYER on a region nixstorage already named. Geometry -> crypto -> filesystem, three
@@ -473,6 +484,82 @@ let
         '';
       };
 
+      initrdUnlock = {
+        enable = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = ''
+            Open THIS volume in the INITRD (stage 1, before switch-root) instead of -- or in
+            addition to being merely declared for -- the post-boot chain this file itself owns.
+            Read ONLY by `modules/initrd.nix`, a SEPARATE NixOS-only `nixosModule` (never part of
+            `systemManagerModules` -- system-manager has no `boot.initrd.*` surface at all, see
+            this file's own "ONE FILE, BOTH BACKENDS" header). Declaring the fact here, on the
+            volume itself, keeps ONE table of "which volumes exist and in what order" even though
+            two different files act on it -- the alternative (a second, independently-typed volume
+            list in modules/initrd.nix) is exactly the "two owners of one fact" class of bug
+            `manageUnlock`'s own doc names above.
+
+            REQUIRES `raiseMode = "preopened"` (asserted below): a volume this flag opens in the
+            initrd is, by the time stage-2 starts, already exactly the state `raiseMode =
+            "preopened"` describes -- `nixluks-storage.target` must never also try to raise the
+            post-boot `systemd-cryptsetup@` chain for it (at best a no-op, at worst -- per this
+            file's own HOT MODE section -- a second prompt for a passphrase already consumed once).
+
+            THE INCIDENT THIS CLOSES: nixnas's own `modules/store/location.nix` runs precisely
+            this mechanism today -- the identical serial-unlock-with-keyring-cache chain this file
+            already generalised for stage 2, run one stage earlier, for the volumes that must be
+            open before `/` and `/nix` even exist -- with NO extraction anywhere: not in this
+            file (which only ever covered stage 2), and not in nixboot (whose own `remoteUnlock`
+            guards a different secret entirely -- see the SCOPE note above). A host that is not
+            nixnas and needs the SAME thing (a hot store, a root-on-network-disk, any host whose
+            `/` or `/nix` is itself LUKS) had nowhere to get it before `modules/initrd.nix`.
+          '';
+        };
+
+        critical = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = ''
+            Only read when `initrdUnlock.enable = true`. Is this volume needed to reach
+            switch-root AT ALL (it backs `/` or `/nix`, or a device the initrd's own root/store
+            mount depends on)? true pins `x-systemd.device-timeout=0` -- an INFINITE wait for the
+            backing device job -- and a missing/failed unlock correctly STOPS the boot. false
+            (the default): `nofail` plus a FINITE wait (`initrdUnlock.timeoutSec`) -- a missing or
+            dead disk is skipped, never blocks the boot -- the data-member stance.
+
+            THE FIELD INCIDENT THIS PINS: nixnas's own `modules/boot/disk.nix` documents a real
+            lockout (2026-07-04) -- a slow-POST server plus an unanswered LUKS prompt hit
+            systemd's `DefaultDeviceTimeoutSec` (90s) on the BACKING DEVICE JOB (not the password
+            query, which already waits forever) and dropped into a locked emergency shell with no
+            root credential yet. `x-systemd.device-timeout=0` on the crypttab entry is the proven
+            fix; `nixnas.modules.store.location` applies it unconditionally to every boot-critical
+            member and never to a data member (which wants the OPPOSITE: fail fast past a
+            reasonable wait, never hang the boot on a disk that legitimately is not there).
+            Getting this backwards for even one volume reproduces one incident or the other --
+            hence a single explicit bool per volume, never a global default guessed at.
+          '';
+        };
+
+        timeoutSec = mkOption {
+          type = types.ints.unsigned;
+          default = 45;
+          example = 45;
+          description = ''
+            Only read when `initrdUnlock.enable = true` AND `initrdUnlock.critical = false`
+            (a critical member's wait is unconditionally INFINITE -- see `critical`'s own doc --
+            this value is never consulted for one). How many seconds the backing device job waits
+            before this NON-critical volume is skipped (`nofail`) rather than blocking the boot.
+            Default 45 matches nixnas's own hardcoded value (`modules/store/location.nix`: "45 s:
+            generous enough for cold-boot HDD/SMR enumeration + spin-up, still FINITE so a
+            genuinely dead/absent archive disk is skipped ... rather than hanging the boot
+            forever"), generalised into a per-volume option rather than restated as a second
+            constant that could drift from the first.
+          '';
+        };
+      };
+
       headerBackup.destination = mkOption {
         type = types.nullOr types.path;
         default = null;
@@ -664,6 +751,13 @@ in
               optionals (devDups != [ ]) [{
                 assertion = false;
                 message = ''nixluks.volumes: ${concatStringsSep ", " (map (n: "\"${n}\"") devDups)} declare the SAME device -- each volume must name a distinct LUKS container.'';
+              }])
+        ++ (let
+              initrdNames = lib.filter (n: cfg.volumes.${n}.initrdUnlock.enable) volNames;
+            in
+              optionals (initrdNames != [ ] && cfg.raiseMode != "preopened") [{
+                assertion = false;
+                message = ''nixluks.volumes: ${concatStringsSep ", " (map (n: "\"${n}\"") initrdNames)} set initrdUnlock.enable = true (opened by modules/initrd.nix, in the initrd) but nixluks.raiseMode = "${cfg.raiseMode}", not "preopened". A volume already open by the time stage-2 starts must never also have this file's own post-boot nixluks-storage.target try to raise the systemd-cryptsetup@ chain for it -- at best a no-op, at worst (see this file's own HOT MODE section) a second prompt for a passphrase already consumed once. Set nixluks.raiseMode = "preopened".'';
               }]);
 
       environment.etc."crypttab".text = crypttab + "\n";

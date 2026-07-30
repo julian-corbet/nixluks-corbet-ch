@@ -23,9 +23,18 @@
       nixosModules.nixluks = ./modules/nixluks.nix;
       nixosModules.default = self.nixosModules.nixluks;
 
+      # NixOS-only, separately exported, NEVER part of `nixosModules.default` and NEVER a
+      # systemManagerModule -- see modules/initrd.nix's own header for exactly why this cannot be
+      # folded into modules/nixluks.nix (system-manager has no `boot.initrd.*` surface at all).
+      # Reads `config.nixluks.volumes` the base module already declares; opt a volume in with
+      # `nixluks.volumes.<name>.initrdUnlock.enable = true` (and the whole host's
+      # `nixluks.raiseMode = "preopened"`, asserted by the base module).
+      nixosModules.initrd = ./modules/initrd.nix;
+
       # The system-manager (numtide) equivalent, for the one target this design requires nixluks
       # on that is NOT NixOS. The SAME file, unchanged -- see modules/nixluks.nix's own
       # "ONE FILE, BOTH BACKENDS" header for exactly why that is honest rather than lazy.
+      # `nixosModules.initrd` has deliberately no counterpart here at all.
       systemManagerModules.nixluks = ./modules/nixluks.nix;
       systemManagerModules.default = self.systemManagerModules.nixluks;
 
@@ -35,12 +44,18 @@
       lib.devicePathType = import ./lib/device-path.nix { inherit lib; };
 
       checks = forAllSystems (system:
-        import ./checks {
+        (import ./checks {
           pkgs = pkgsFor system;
           inherit lib nixpkgs system;
           nixluksModule = self.nixosModules.nixluks;
           systemManagerLib = system-manager.lib;
-        });
+        })
+        // (import ./checks/initrd.nix {
+          pkgs = pkgsFor system;
+          inherit lib nixpkgs system;
+          nixluksModule = self.nixosModules.nixluks;
+          nixluksInitrdModule = self.nixosModules.initrd;
+        }));
 
       formatter = forAllSystems (system: (pkgsFor system).nixpkgs-fmt);
     };
