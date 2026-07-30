@@ -1,5 +1,5 @@
 {
-  description = "nixluks -- declare which LUKS2 volumes a host unlocks post-boot, in what order, with header-backup orchestration and drift verification wired to the same declaration; the serial-unlock-with-keyring-cache mechanism generalised out of nixnas so a fleet member, a disaster-recovery vault, or a rescue image can all share it.";
+  description = "nixluks -- declare which LUKS2 volumes a host unlocks post-boot, in what order, with header-backup orchestration and drift verification wired to the same declaration; the serial-unlock-with-keyring-cache mechanism generalised out of nixnas so any host, a disaster-recovery vault, or a rescue image can all share it.";
 
   inputs = {
     # Used by `checks` only. The module itself takes `pkgs` from the consuming evaluation and

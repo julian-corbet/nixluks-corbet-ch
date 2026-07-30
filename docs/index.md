@@ -32,7 +32,7 @@ that looks for a host with many volumes.
 connect.nix's own implementation relies on `attrNames`, which Nix guarantees
 returns lexicographically sorted names — a fine solution for an appliance
 where the operator names disks `archive0`, `archive1`, … in the order they
-should open. It is a worse fit for a fleet member, a rescue image, or a
+should open. It is a worse fit for a host, a rescue image, or a
 vault, where a volume's most natural name (a role: `vault`, `primary`,
 `backup-target`) often has no relationship to the order it should unlock in.
 nixluks makes `order` its own field for exactly this reason: naming and
@@ -100,7 +100,7 @@ in the VM test.
 
 ## `nixluks-verify` and the failure it exists to catch
 
-The motivating case is concrete, not hypothetical: a key on this fleet was
+The motivating case is concrete, not hypothetical: a key on a real host had
 rotated twice and lost twice, and nothing noticed either time — because
 nothing was reading the header back and comparing it to what was supposed to
 be there. `cryptsetup luksDump --dump-json-metadata` reports a LUKS2

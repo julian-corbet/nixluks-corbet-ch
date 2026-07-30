@@ -8,7 +8,7 @@
 #
 # THIS IS AN EXTRACTION. The serial-unlock-with-keyring-cache mechanism below is lifted, not
 # reinvented, from nixnas's modules/storage/connect.nix (`storage.unlock`), generalised so any
-# host -- a fleet member, a disaster-recovery vault, a rescue image -- can declare the same chain
+# host -- an ordinary machine, a disaster-recovery vault, a rescue image -- can declare the same chain
 # without depending on nixnas's appliance-specific USB/hot-store machinery. Read that file's own
 # header for the field-proven design this one lifts out; what follows restates it in
 # host-agnostic terms and adds header-backup orchestration and drift verification, which did not
@@ -174,7 +174,7 @@ let
   # common case of a copy-pasted declaration. This is the one property connect.nix's header calls
   # load-bearing (the serial chain only keeps the keyring cache warm if the order is fixed and
   # repeatable) -- restated with an explicit field instead of connect.nix's own `attrNames` sort,
-  # because a fleet/vault/rescue's volumes are not always nameable in the order they should open.
+  # because a host's/vault's/rescue's volumes are not always nameable in the order they should open.
   byOrder = a: b:
     let oa = cfg.volumes.${a}.order; ob = cfg.volumes.${b}.order;
     in if oa != ob then oa < ob else a < b;

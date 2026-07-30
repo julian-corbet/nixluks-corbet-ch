@@ -18,7 +18,7 @@ the first of these three things — a mechanism that already existed,
 field-proven, in the sibling
 [nixnas](https://github.com/julian-corbet/nixnas-corbet-ch) project's own
 appliance-specific storage-unlock code — plus the two that never existed
-anywhere in this fleet before this repo.
+anywhere before this repo.
 
 **The mechanism, in one sentence**: each declared volume opens SERIALLY via
 `systemd-cryptsetup@<name>.service` (systemd's own crypttab-generator units,
