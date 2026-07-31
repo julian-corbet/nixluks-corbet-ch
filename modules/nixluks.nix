@@ -305,6 +305,7 @@ let
             echo "FAIL  ${n}: cryptsetup luksHeaderBackup against ${cfg.volumes.${n}.device} did not succeed -- see its own error output above"
             fail=1
           fi
+          fi
         fi
       '') backupNames}
       if [ "$fail" -ne 0 ]; then
