@@ -280,10 +280,27 @@ let
           if [ "$other_bits" != "0" ] || [ "$group_bits" != "0" ]; then
             echo "FAIL  ${n}: $destdir is mode $mode -- grants group or other access. A header backup is as sensitive as the passphrase-protected device it came from (with the passphrase, it opens everything); refusing to write one anywhere but a directory only its owner can read. chmod 0700 $destdir and retry."
             fail=1
-          elif cryptsetup luksHeaderBackup --header-backup-file "$dest" "${cfg.volumes.${n}.device}"; then
-            chmod 0600 "$dest"
+          # Write to a fresh temporary name, then move it into place.
+          #
+          # `cryptsetup luksHeaderBackup` REFUSES an existing --header-backup-file and exits
+          # non-zero. Writing straight to $dest therefore succeeds exactly once and fails every
+          # run afterwards, which is the worst possible shape for a scheduled job: the unit goes
+          # red nightly while a stale backup sits on disk looking current. Observed doing exactly
+          # that on a real host -- backups dated two days earlier, the timer failing every night
+          # since, and nobody the wiser because a header backup is only ever read on the day
+          # everything else has already gone wrong.
+          #
+          # Deleting $dest first would be the obvious fix and is the wrong one: it leaves a
+          # window with NO backup at all, and if the fresh dump then fails, the only copy is gone.
+          # Writing beside it and renaming means the previous header survives until a complete new
+          # one has landed, and `mv` within one directory is atomic.
+          tmp="$dest.new.$$"
+          if cryptsetup luksHeaderBackup --header-backup-file "$tmp" "${cfg.volumes.${n}.device}"; then
+            chmod 0600 "$tmp"
+            mv -f "$tmp" "$dest"
             echo "PASS  ${n}: header backed up to $dest (mode 0600)"
           else
+            rm -f "$tmp"
             echo "FAIL  ${n}: cryptsetup luksHeaderBackup against ${cfg.volumes.${n}.device} did not succeed -- see its own error output above"
             fail=1
           fi
