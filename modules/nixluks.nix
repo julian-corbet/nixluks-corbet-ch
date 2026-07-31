@@ -280,6 +280,7 @@ let
           if [ "$other_bits" != "0" ] || [ "$group_bits" != "0" ]; then
             echo "FAIL  ${n}: $destdir is mode $mode -- grants group or other access. A header backup is as sensitive as the passphrase-protected device it came from (with the passphrase, it opens everything); refusing to write one anywhere but a directory only its owner can read. chmod 0700 $destdir and retry."
             fail=1
+          else
           # Write to a fresh temporary name, then move it into place.
           #
           # `cryptsetup luksHeaderBackup` REFUSES an existing --header-backup-file and exits
