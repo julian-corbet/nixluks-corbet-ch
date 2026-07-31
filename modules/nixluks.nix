@@ -267,34 +267,33 @@ let
         echo "== ${n} (role: ${if cfg.volumes.${n}.role == null then "unspecified" else cfg.volumes.${n}.role}) -> ${cfg.volumes.${n}.headerBackup.destination}"
         dest="${cfg.volumes.${n}.headerBackup.destination}"
         destdir="$(dirname "$dest")"
+        # FLAT, deliberately. An earlier version nested the permission check inside the
+        # directory check inside the backup, and a later edit left the arms one `fi` short --
+        # which `nix flake check --no-build` cannot catch, because it never builds the script
+        # and so never runs shellcheck. The failure surfaced only as a nightly unit refusing to
+        # start. Two guard arms and one real branch, all at the same level, is harder to get
+        # wrong and reads the same way it runs.
+        mode=""
+        if [ -d "$destdir" ]; then mode="$(stat -c '%a' "$destdir")"; fi
         if [ ! -d "$destdir" ]; then
           echo "FAIL  ${n}: destination directory $destdir does not exist -- create it (mode 0700) before backing up into it"
           fail=1
+        elif [ "''${mode: -1}" != "0" ] || [ "''${mode: -2:1}" != "0" ]; then
+          # A header backup contains the wrapped master key; see "HEADER BACKUPS ARE SENSITIVE"
+          # in this module's header for why any group/other access is refused, not warned about.
+          echo "FAIL  ${n}: $destdir is mode $mode -- grants group or other access. A header backup is as sensitive as the passphrase-protected device it came from (with the passphrase, it opens everything); refusing to write one anywhere but a directory only its owner can read. chmod 0700 $destdir and retry."
+          fail=1
         else
-          # Refuse a destination directory that grants ANY access to group or other -- a header
-          # backup contains the wrapped master key; see this module's own "HEADER BACKUPS ARE
-          # SENSITIVE" header section for why this is refused, not merely warned about.
-          mode="$(stat -c '%a' "$destdir")"
-          other_bits="''${mode: -1}"
-          group_bits="''${mode: -2:1}"
-          if [ "$other_bits" != "0" ] || [ "$group_bits" != "0" ]; then
-            echo "FAIL  ${n}: $destdir is mode $mode -- grants group or other access. A header backup is as sensitive as the passphrase-protected device it came from (with the passphrase, it opens everything); refusing to write one anywhere but a directory only its owner can read. chmod 0700 $destdir and retry."
-            fail=1
-          else
           # Write to a fresh temporary name, then move it into place.
           #
           # `cryptsetup luksHeaderBackup` REFUSES an existing --header-backup-file and exits
-          # non-zero. Writing straight to $dest therefore succeeds exactly once and fails every
-          # run afterwards, which is the worst possible shape for a scheduled job: the unit goes
-          # red nightly while a stale backup sits on disk looking current. Observed doing exactly
-          # that on a real host -- backups dated two days earlier, the timer failing every night
-          # since, and nobody the wiser because a header backup is only ever read on the day
-          # everything else has already gone wrong.
+          # non-zero, so writing straight to $dest succeeds exactly once and fails every run
+          # after -- the unit goes red nightly while a stale backup sits there looking current.
           #
-          # Deleting $dest first would be the obvious fix and is the wrong one: it leaves a
-          # window with NO backup at all, and if the fresh dump then fails, the only copy is gone.
-          # Writing beside it and renaming means the previous header survives until a complete new
-          # one has landed, and `mv` within one directory is atomic.
+          # Deleting $dest first is the obvious fix and the wrong one: it opens a window with no
+          # backup at all, and if the fresh dump then fails the only copy is gone. Writing beside
+          # it and renaming keeps the previous header until a complete new one has landed, and
+          # `mv` within one directory is atomic.
           tmp="$dest.new.$$"
           if cryptsetup luksHeaderBackup --header-backup-file "$tmp" "${cfg.volumes.${n}.device}"; then
             chmod 0600 "$tmp"
@@ -304,7 +303,6 @@ let
             rm -f "$tmp"
             echo "FAIL  ${n}: cryptsetup luksHeaderBackup against ${cfg.volumes.${n}.device} did not succeed -- see its own error output above"
             fail=1
-          fi
           fi
         fi
       '') backupNames}
