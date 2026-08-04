@@ -71,6 +71,16 @@
 # future edit that added one of those calls would fail CI before it could ship, not rely on a
 # reviewer noticing.
 #
+# ENROLLMENT IS OUTSIDE THAT LINE TOO, and deliberately. `systemd-cryptenroll` -- TPM2, FIDO2,
+# recovery keys, any of it -- WRITES a key slot, which is the same class of act as `luksAddKey`
+# and is refused for the same reason: an enrollment that appears because a config file changed is
+# an enrollment nobody was standing in front of the machine to authorise, and it is not reversible
+# by reverting the config. `tpm2.installTooling` exists and installs `tpm2-tools`, which is the
+# opposite of enrolling: it lets an operator READ what their TPM and PCRs actually are before
+# deciding anything. `cryptenroll`, `luksChangeKey`, `luksConvertKey` and `reencrypt` are in the
+# same source-text check as the list above, so "installed but never enrolled" is a property CI
+# enforces rather than a promise this comment makes.
+#
 # HEADER BACKUPS ARE SENSITIVE. A LUKS header backup (`cryptsetup luksHeaderBackup`) is NOT the
 # passphrase, but it IS the KDF-wrapped master key plus every keyslot -- with the passphrase (or a
 # weak one, brute-forced offline against a copy an attacker can take their time with), it opens the
@@ -148,6 +158,15 @@
 #     (nix/lib.nix's `returnIfNoAssertions`).
 #   - `environment.systemPackages` -- how every `nixluks-*` tool actually reaches the host's PATH,
 #     identical on both backends.
+# The ONE thing that is genuinely not identical is what the host's OWN package manager has to
+# supply, and this module does not pretend otherwise: `archPackages` (below) PUBLISHES the pacman
+# names an Arch host needs -- `cryptsetup` above all, because the crypttab written here is read by
+# the HOST's `systemd-cryptsetup-generator` and the units it generates run the HOST's own
+# `/usr/bin/systemd-cryptsetup`, neither of which comes from the Nix store. It publishes names
+# only; nothing here installs them, and nothing here references any particular reconciler (the
+# consumer writes `nixarch.packages.pacman = config.nixluks.archPackages;`, or whatever its own
+# installer's equivalent is). On NixOS that list is simply unread, and the module keeps taking
+# `pkgs.*` from the consuming evaluation exactly as before.
 # What this module deliberately never touches is exactly what system-manager cannot do:
 # `boot.*` (no bootloader/kernel/initrd surface -- irrelevant anyway, see SCOPE above: the initrd
 # is nixboot's domain, not this module's) and `users.*` (no dedicated service account -- every
@@ -164,7 +183,7 @@ let
   inherit (lib)
     mkEnableOption mkOption mkIf mkMerge types literalExpression
     concatStringsSep concatMapStringsSep mapAttrsToList listToAttrs nameValuePair
-    imap0 optional optionals optionalString sort filter filterAttrs attrNames;
+    imap0 optional optionals optionalAttrs optionalString sort filter filterAttrs attrNames;
 
   devicePathType = import ../lib/device-path.nix { inherit lib; };
 
@@ -195,6 +214,13 @@ let
   unlockUnits = map unlockUnitName sortedNames;
 
   isPreopened = cfg.raiseMode == "preopened";
+
+  # The one predicate this module's whole `config` body is gated on, named once instead of
+  # restated. `enable` alone is not the question: a host that switches nixluks on but declares no
+  # volume has nothing to render, and `archPackages` below must answer the SAME question --
+  # publishing `cryptsetup` for a host that renders no unit, no crypttab line and no tool would
+  # put a package on a machine nothing here actually asked for.
+  moduleActive = cfg.enable && cfg.volumes != { };
 
   # `name -> /dev/mapper/name`, a STABLE mapper the operator (or a downstream fileSystems entry)
   # references. `noauto`: nothing opens at boot from crypttab alone -- nixluks-storage.target pulls
@@ -694,9 +720,93 @@ in
         rotation that only half-happened, shows up here instead of during the next recovery.
       '';
     };
+
+    tpm2.installTooling = mkOption {
+      type = types.bool;
+      default = false;
+      example = true;
+      description = ''
+        Put the TPM2 userland (`tpm2-tools`, and the pacman name of the same on an Arch host via
+        `archPackages`) on this machine's PATH. TOOLING ONLY.
+
+        THIS ENROLLS NOTHING, AND CANNOT. Enabling it adds a package and changes not one byte on
+        any device: no keyslot is added, removed, changed or read; `systemd-cryptenroll` is never
+        invoked, and nixluks has no option that would invoke it -- the module's own SAFETY
+        INVARIANT (see this file's header) is that nothing here ever writes a LUKS header, and
+        checks/default.nix enforces exactly that against this module's source text, `cryptenroll`
+        included. A volume's key slots after enabling this are byte-identical to its key slots
+        before.
+
+        WHY IT EXISTS ANYWAY: deciding whether to TPM-seal a volume is a separate, deliberate,
+        one-way-ish act an operator performs by hand, at a keyboard, against a specific device --
+        and it needs `tpm2_getcap`/`tpm2_pcrread` on PATH first, to read what the machine's own
+        TPM and PCR state actually are BEFORE anything is sealed to them. Shipping the tooling
+        declaratively and the enrollment never is the honest split: the machine is ready to be
+        inspected, and no declaration in this repo can ever silently rewrite a key slot.
+      '';
+    };
+
+    archPackages = mkOption {
+      type = types.listOf types.str;
+      readOnly = true;
+      # COMPUTED IN THE DEFAULT, not assigned in `config`, for one specific reason: `readOnly`
+      # counts a declared default as a definition, so an option that has both is already "set
+      # twice" before any consumer touches it. Keeping the value here leaves `readOnly` doing its
+      # real job -- a consumer that tries to DEFINE this list gets a clear read-only error instead
+      # of silently merging into a published fact -- while still letting the value be gated on
+      # `moduleActive`, which a `config` assignment inside this module's own `mkIf` could not do
+      # without making the option unreadable on exactly the hosts where the answer is "nothing".
+      default = optionals moduleActive (
+        [ "cryptsetup" ] ++ optional cfg.tpm2.installTooling "tpm2-tools"
+      );
+      defaultText = literalExpression ''[ "cryptsetup" ] ++ lib.optional config.nixluks.tpm2.installTooling "tpm2-tools"'';
+      description = ''
+        What nixluks needs from an Arch host's OWN package manager, as pacman names.
+
+        This module cannot install them: on Arch there is no installer here to call. Feed it to
+        whatever reconciler the host uses, e.g.
+
+          nixarch.packages.pacman = config.nixluks.archPackages;
+
+        Kept as a plain list of strings rather than wired into any particular reconciler on
+        purpose -- that would couple this flake to one consumer's package module. nixluks
+        PUBLISHES; the consumer CONNECTS.
+
+        WHY A DISTRO `cryptsetup` IS GENUINELY NEEDED, when every `nixluks-*` tool already
+        carries its own `pkgs.cryptsetup` as a pinned `runtimeInputs` store path: the crypttab
+        this module writes is not read by anything from the Nix store. It is read by the HOST's
+        own `systemd-cryptsetup-generator`, and the units it generates run the HOST's own
+        `/usr/bin/systemd-cryptsetup`, which resolves libcryptsetup from the distro package. On
+        NixOS that package arrives with the system's own systemd and nothing here has to ask for
+        it; on Arch it is an ordinary package that can be absent, or present only as an
+        undeclared dependency some other package happened to pull in -- which is not a
+        declaration, and is exactly what one `pacman -Rns` of that other package undoes.
+
+        Empty unless this module is actually active (`enable` plus at least one declared volume),
+        the same gate everything else here renders under.
+      '';
+    };
+
+    aurPackages = mkOption {
+      type = types.listOf types.str;
+      readOnly = true;
+      default = [ ];
+      description = ''
+        The AUR half of the same publication, kept SEPARATE because `pacman -S` cannot resolve an
+        AUR name -- it fails the whole transaction with "target not found", taking every other
+        package in that converge down with it. Wire it to the AUR side:
+
+          nixarch.packages.aur = config.nixluks.aurPackages;
+
+        ALWAYS EMPTY today, and declared anyway: everything nixluks needs is in an official Arch
+        repo. It exists so a consumer can wire both channels the same way for every `nix*` module
+        it composes, without having to special-case this one -- and so that if nixluks ever does
+        need an AUR-only tool, no consumer has to change to receive it.
+      '';
+    };
   };
 
-  config = mkIf (cfg.enable && cfg.volumes != { }) (mkMerge [
+  config = mkIf moduleActive (mkMerge [
     {
       assertions =
         (map
@@ -777,10 +887,35 @@ in
                 message = ''nixluks.volumes: ${concatStringsSep ", " (map (n: "\"${n}\"") initrdNames)} set initrdUnlock.enable = true (opened by modules/initrd.nix, in the initrd) but nixluks.raiseMode = "${cfg.raiseMode}", not "preopened". A volume already open by the time stage-2 starts must never also have this file's own post-boot nixluks-storage.target try to raise the systemd-cryptsetup@ chain for it -- at best a no-op, at worst (see this file's own HOT MODE section) a second prompt for a passphrase already consumed once. Set nixluks.raiseMode = "preopened".'';
               }]);
 
-      environment.etc."crypttab".text = crypttab + "\n";
+      # /etc/crypttab IS CLAIMED ONLY WHEN THIS MODULE ACTUALLY OWNS AN UNLOCK -- i.e. when at
+      # least one volume has `manageUnlock = true`. A host that declares its volumes purely so
+      # their headers get backed up and their live shape verified (every volume
+      # `manageUnlock = false`, the case that flag exists for) has nothing to put in the file:
+      # `crypttab` renders to the empty string, and writing an empty file would be the module
+      # taking OWNERSHIP of /etc/crypttab in exchange for contributing nothing to it.
+      #
+      # That is a no-op on NixOS, where /etc is generated wholesale and an empty crypttab is
+      # indistinguishable from no crypttab. It is NOT a no-op on the system-manager backend: there
+      # /etc/crypttab is a real, pre-existing, distro-owned file that can already carry the root
+      # and swap unlock lines the initrd or the distro's own installer put there, and
+      # `environment.etc` REPLACES a file wholesale rather than appending to it. system-manager
+      # refuses that replacement by default (`replaceExisting = false` -> activation fails with
+      # "Unmanaged path already exists"), so the immediate failure is loud rather than
+      # destructive -- but a consumer who reaches for `replaceExisting` to get past it would
+      # silently swap a boot-critical file for an empty one, and find out at the next boot.
+      #
+      # Nothing is lost for hosts that DO manage an unlock: `managedNames` non-empty is exactly
+      # the set of lines this file would have written.
+      environment.etc = optionalAttrs (managedNames != [ ]) {
+        "crypttab".text = crypttab + "\n";
+      };
       environment.systemPackages = [ nixluks-unlock ]
         ++ optional (backupNames != [ ]) nixluks-backup-headers
-        ++ optional cfg.verify.enable nixluks-verify;
+        ++ optional cfg.verify.enable nixluks-verify
+        # TOOLING ONLY -- never an enrollment. See tpm2.installTooling's own description: this
+        # puts `tpm2_*` on PATH so an operator can READ the machine's TPM/PCR state, and nothing
+        # in this module ever calls `systemd-cryptenroll` or touches a key slot.
+        ++ optional cfg.tpm2.installTooling pkgs.tpm2-tools;
 
       # Serialise the unlocks so the keyring cache is always HIT: the first volume in `order`
       # prompts, every later one finds the cached passphrase and opens silently. This dependency

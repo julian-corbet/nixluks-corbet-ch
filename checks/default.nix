@@ -34,6 +34,18 @@
 #   8. Both backends agree -- the NixOS and system-manager evaluations of the same input resolve
 #      to the identical tool set, proving modules/nixluks.nix's own "ONE FILE, BOTH BACKENDS"
 #      claim rather than merely asserting it in a comment.
+#   9. `archPackages` publishes exactly what an Arch host's OWN package manager has to supply
+#      (`cryptsetup`, because the crypttab written here is read by the HOST's generator), is empty
+#      when the module renders nothing, and is identical on both backends. `aurPackages` exists
+#      and is empty.
+#  10. `tpm2.installTooling` INSTALLS AND ENROLLS NOTHING: enabling it changes the package set and
+#      nothing else -- byte-identical rendered unit commands and crypttab, no `cryptenroll`
+#      anywhere in either the module's source or the rendered config. "Installed but never
+#      enrolled" is a checked property, not a promise a comment makes.
+#  11. /etc/crypttab is claimed ONLY when at least one volume has `manageUnlock = true`. A host
+#      declaring volumes purely for header backup writes no crypttab at all -- an empty one is a
+#      no-op on NixOS but a demand to take over a boot-critical distro-owned file on the
+#      system-manager backend, where `environment.etc` replaces a file wholesale.
 { pkgs, lib, nixpkgs, system, nixluksModule, systemManagerLib }:
 
 let
@@ -146,6 +158,68 @@ let
   hasTool = cfg: name:
     lib.any (p: lib.hasInfix name (p.name or "")) cfg.environment.systemPackages;
 
+  # ── TPM tooling: installed, never enrolled ───────────────────────────────────────────────────
+  # The pair below differs in ONE input -- tpm2.installTooling -- so anything that differs in the
+  # RESULT beyond the package set is this option doing something it has no business doing.
+  cfg-tpm-off = cfg-with-backup;
+  cfg-tpm-on = evalNixos (lib.recursiveUpdate validBase {
+    nixluks.volumes.primary.headerBackup.destination = "/mnt/vault/luksHeaderBackups/primary.img";
+    nixluks.tpm2.installTooling = true;
+  });
+
+  # Every command any rendered unit would actually RUN, as plain strings. An enrollment could only
+  # ever reach a device through one of these; comparing the whole map between the two configs
+  # proves the TPM option adds no unit, no ExecStart, and no change to an existing one.
+  unitCommands = cfg:
+    lib.mapAttrs
+      (_: s: builtins.toJSON (lib.mapAttrs (_: v: toString v)
+        (lib.filterAttrs (k: _: lib.hasPrefix "Exec" k) (s.serviceConfig or { }))))
+      cfg.systemd.services;
+
+  # Only the units that actually DIFFER. The comparison above is over every unit the whole system
+  # renders (a new unit anywhere is exactly what this must catch); printing all of them on failure
+  # buries the one line a reader needs under the entire NixOS unit set.
+  differingUnits = a: b:
+    let
+      ca = unitCommands a;
+      cb = unitCommands b;
+      keys = lib.unique (lib.attrNames ca ++ lib.attrNames cb);
+    in
+    lib.filter (k: (ca.${k} or null) != (cb.${k} or null)) keys;
+
+  # ── manageUnlock = false everywhere: nixluks must not claim /etc/crypttab at all ──────────────
+  # The header-backup-only host. On NixOS an empty crypttab is indistinguishable from none; on the
+  # system-manager backend /etc/crypttab is a real distro-owned file that can already carry the
+  # root and swap unlock lines, and `environment.etc` replaces a file wholesale.
+  unmanagedBase = {
+    nixluks.enable = true;
+    nixluks.raiseMode = "preopened";
+    nixluks.volumes.rootvol = {
+      device = "/dev/disk/by-id/test-rootvol";
+      order = 1;
+      manageUnlock = false;
+      headerBackup.destination = "/mnt/vault/luksHeaderBackups/rootvol.img";
+    };
+    nixluks.volumes.swapvol = {
+      device = "/dev/disk/by-id/test-swapvol";
+      order = 2;
+      manageUnlock = false;
+      headerBackup.destination = "/mnt/vault/luksHeaderBackups/swapvol.img";
+    };
+  };
+  cfg-unmanaged = evalNixos unmanagedBase;
+  cfg-sm-unmanaged = evalSm unmanagedBase;
+
+  # The same host with ONE volume whose unlock nixluks does own -- the file comes back, carrying
+  # that line and only that line.
+  cfg-partly-managed = evalNixos (lib.recursiveUpdate unmanagedBase {
+    nixluks.volumes.vault = {
+      device = "/dev/disk/by-id/test-vault";
+      order = 3;
+      manageUnlock = true;
+    };
+  });
+
   # ── system-manager backend -- proves modules/nixluks.nix's "ONE FILE, BOTH BACKENDS" claim ────
   evalSm = extraConfig:
     (systemManagerLib.makeSystemConfig {
@@ -181,6 +255,17 @@ let
     (check "backend-parity/storage-target-renders-on-system-manager-too"
       (cfg-sm-basic.systemd.targets ? "nixluks-storage")
       "system-manager systemd.targets: ${builtins.toJSON (lib.attrNames cfg-sm-basic.systemd.targets)}")
+
+    (check "backend-parity/archPackages-identical"
+      (cfg-sm-basic.nixluks.archPackages == cfg-basic.nixluks.archPackages)
+      "system-manager: ${builtins.toJSON cfg-sm-basic.nixluks.archPackages}, NixOS: ${builtins.toJSON cfg-basic.nixluks.archPackages}")
+
+    # The case the whole gate exists for, checked on the backend where it MATTERS: a
+    # system-manager host declaring volumes purely for header backup must not demand ownership of
+    # a distro-owned /etc/crypttab it has nothing to write into.
+    (check "backend-parity/no-etc-crypttab-claim-on-system-manager-when-no-unlock-is-managed"
+      (!(cfg-sm-unmanaged.environment.etc ? "crypttab"))
+      "system-manager environment.etc: ${builtins.toJSON (lib.attrNames cfg-sm-unmanaged.environment.etc)}")
   ];
 
   # ── The SAFETY INVARIANT, made mechanically checkable: no destructive/creating cryptsetup or
@@ -189,7 +274,25 @@ let
   # explain why they are absent). A future edit that added a real call to one of these inside a
   # `text = ''…'';`/`script = ''…'';` block would fail this check, not rely on a reviewer noticing.
   moduleSource = builtins.readFile ../modules/nixluks.nix;
-  codeOnlyLines = lib.filter (l: !(isCommentLine l)) (lib.splitString "\n" moduleSource);
+
+  # PROSE IS NOT CODE. `#` comment lines were always stripped here, because the module's own
+  # SAFETY INVARIANT section has to NAME the operations it forbids in order to explain that they
+  # are absent. A multi-line `description = ''…''` block is the same prose in a different syntax --
+  # `tpm2.installTooling`'s description exists precisely to say "this never enrolls anything" --
+  # and a source grep cannot tell a sentence from a call. So those blocks are dropped too, and
+  # NOTHING else is: a `text = ''…''` / `script = ''…''` body, the only place in this module where
+  # a real invocation could ever live, is still scanned in full.
+  stripDescriptions = lines:
+    (lib.foldl'
+      (acc: l:
+        if acc.inDesc || lib.hasInfix "description = ''" l
+        then acc // { inDesc = !(lib.hasInfix "'';" l); }
+        else acc // { out = acc.out ++ [ l ]; })
+      { inDesc = false; out = [ ]; }
+      lines).out;
+
+  codeOnlyLines = stripDescriptions
+    (lib.filter (l: !(isCommentLine l)) (lib.splitString "\n" moduleSource));
   codeOnly = lib.concatStringsSep "\n" codeOnlyLines;
   forbiddenOps = [
     "luksFormat"
@@ -202,6 +305,14 @@ let
     "zpool create"
     "zfs create"
     "zfs destroy"
+    # Enrollment writes a key slot exactly as `luksAddKey` does, so it belongs in the SAME list --
+    # this is what makes `tpm2.installTooling`'s "installed, never enrolled" a property CI holds
+    # rather than a claim a description makes. `cryptenroll` (not the full binary name) so
+    # `systemd-cryptenroll`, a bare `cryptenroll`, and any wrapper around either all trip it.
+    "cryptenroll"
+    "luksChangeKey"
+    "luksConvertKey"
+    "reencrypt"
   ];
   foundForbidden = lib.filter (w: lib.hasInfix w codeOnly) forbiddenOps;
 
@@ -371,6 +482,57 @@ let
         (p: lib.any (n: lib.hasInfix n (p.name or "")) toolNames)
         (lib.filter (p: lib.hasInfix "nixluks" (p.name or "")) cfg-with-backup.environment.systemPackages))
       "systemPackages: ${builtins.toJSON (map (p: p.name or "?") cfg-with-backup.environment.systemPackages)}, expected only: ${builtins.toJSON toolNames}")
+
+    # --- 12. archPackages publishes what an Arch host's OWN package manager has to supply --------
+    (check "archPackages/publishes-cryptsetup"
+      (cfg-basic.nixluks.archPackages == [ "cryptsetup" ])
+      "got ${builtins.toJSON cfg-basic.nixluks.archPackages}, expected exactly [\"cryptsetup\"] -- the crypttab this module writes is read by the HOST's own generator, whose systemd-cryptsetup does not come from the Nix store")
+
+    (check "archPackages/empty-when-the-module-renders-nothing"
+      (cfg-disabled.nixluks.archPackages == [ ]
+        && (evalNixos { nixluks.enable = true; }).nixluks.archPackages == [ ])
+      "a host with nixluks disabled, or enabled with no volumes declared, must publish no package name at all -- got ${builtins.toJSON cfg-disabled.nixluks.archPackages}")
+
+    (check "archPackages/aur-list-exists-and-is-empty"
+      (cfg-basic.nixluks.aurPackages == [ ] && cfg-tpm-on.nixluks.aurPackages == [ ])
+      "aurPackages must exist (so a consumer can wire both channels uniformly) and be empty -- nothing nixluks needs lives in the AUR; got ${builtins.toJSON cfg-basic.nixluks.aurPackages}")
+
+    # --- 13. TPM2: tooling installed, NOTHING enrolled ------------------------------------------
+    (check "tpm2/tooling-off-by-default"
+      (!(hasTool cfg-tpm-off "tpm2-tools")
+        && !(lib.elem "tpm2-tools" cfg-tpm-off.nixluks.archPackages))
+      "tpm2.installTooling defaults to false; systemPackages: ${builtins.toJSON (map (p: p.name or "?") cfg-tpm-off.environment.systemPackages)}, archPackages: ${builtins.toJSON cfg-tpm-off.nixluks.archPackages}")
+
+    (check "tpm2/tooling-on-reaches-both-delivery-channels"
+      (hasTool cfg-tpm-on "tpm2-tools"
+        && cfg-tpm-on.nixluks.archPackages == [ "cryptsetup" "tpm2-tools" ])
+      "systemPackages: ${builtins.toJSON (map (p: p.name or "?") cfg-tpm-on.environment.systemPackages)}, archPackages: ${builtins.toJSON cfg-tpm-on.nixluks.archPackages}")
+
+    # THE load-bearing one. Enabling the TPM option must change the package set and NOTHING else:
+    # same units, same commands inside them, same crypttab. An enrollment could only reach a
+    # device through a rendered ExecStart, and there is no new or altered one.
+    (check "tpm2/tooling-adds-no-unit-and-no-command"
+      (unitCommands cfg-tpm-on == unitCommands cfg-tpm-off
+        && cfg-tpm-on.environment.etc."crypttab".text == cfg-tpm-off.environment.etc."crypttab".text)
+      "enabling tpm2.installTooling changed something beyond the package set. Units that differ: ${builtins.toJSON (differingUnits cfg-tpm-on cfg-tpm-off)}; with: ${builtins.toJSON (lib.filterAttrs (k: _: lib.elem k (differingUnits cfg-tpm-on cfg-tpm-off)) (unitCommands cfg-tpm-on))}")
+
+    (check "tpm2/no-enroll-invocation-anywhere-in-the-rendered-config"
+      (!(lib.hasInfix "cryptenroll" (builtins.toJSON (unitCommands cfg-tpm-on))))
+      "a rendered unit command mentions cryptenroll: ${builtins.toJSON (unitCommands cfg-tpm-on)}")
+
+    # --- 14. /etc/crypttab is claimed only when this module actually owns an unlock --------------
+    (check "crypttab/not-claimed-when-every-volume-is-manageUnlock-false"
+      (!(cfg-unmanaged.environment.etc ? "crypttab"))
+      "a header-backup-only host wrote an /etc/crypttab anyway -- environment.etc: ${builtins.toJSON (lib.attrNames cfg-unmanaged.environment.etc)}")
+
+    (check "crypttab/header-backup-only-host-still-gets-its-backup-tool-and-verify"
+      (hasTool cfg-unmanaged "nixluks-backup-headers" && hasTool cfg-unmanaged "nixluks-verify")
+      "dropping the crypttab claim must not drop anything else -- systemPackages: ${builtins.toJSON (map (p: p.name or "?") cfg-unmanaged.environment.systemPackages)}")
+
+    (check "crypttab/claimed-again-as-soon-as-one-volume-is-managed"
+      (cfg-partly-managed.environment.etc."crypttab".text
+        == "vault /dev/disk/by-id/test-vault none luks,noauto,nofail\n")
+      "got: ${builtins.toJSON (cfg-partly-managed.environment.etc."crypttab".text or null)} -- expected exactly the one managed volume's line, and no line for either manageUnlock = false volume")
   ]
   ++ backendParityChecks;
 

@@ -130,3 +130,18 @@ exactly the boundary the README's "vs nixstorage" section exists to hold.
 A consumer wanting that convenience composes it themselves, the same way any
 `fileSystems` entry or `systemd.services` unit gates on
 `nixluks-storage.target` today.
+
+No enrollment either — not TPM2, not FIDO2, not a recovery key. Every one of
+those writes a key slot, and a key slot that appears because a config file
+changed is one nobody was at the machine to authorise; reverting the config
+does not take it back. `tpm2.installTooling` is the deliberate half-step: it
+puts `tpm2-tools` on PATH so an operator can READ what the machine's TPM and
+PCR state actually are, and the act of sealing anything to them stays a
+human-at-a-keyboard decision made with `systemd-cryptenroll` directly.
+
+No ownership of a foreign `/etc/crypttab`. On a non-NixOS host that file
+predates nixluks and can carry the machine's root and swap unlock lines;
+`environment.etc` replaces a file wholesale rather than appending, so nixluks
+writes it only when at least one volume has `manageUnlock = true` — i.e. only
+when it has a line of its own to put there. A host declaring volumes purely
+for header backup leaves the file alone entirely.

@@ -55,7 +55,16 @@ not just a comment to trust — `checks/default.nix`'s own
 `structurally-safe` test reads the module's actual source text and fails the
 build if a destructive/creating cryptsetup or filesystem call (`luksFormat`,
 `luksAddKey`, `wipefs`, `mkfs.`, …) ever appears in its real code, comments
-excluded.
+and option prose excluded.
+
+**Enrollment is on the far side of that line too.** `systemd-cryptenroll` —
+TPM2, FIDO2, recovery keys, any of it — WRITES a key slot, which is the same
+class of act as `luksAddKey`: an enrollment that happens because a config file
+changed is one nobody was standing at the machine to authorise, and reverting
+the config does not undo it. `cryptenroll`, `luksChangeKey`, `luksConvertKey`
+and `reencrypt` are in the same source-text check. See "TPM2: tooling, never
+enrollment" below for the option that installs the userland and still enrolls
+nothing.
 
 **Header backups are sensitive.** A LUKS header backup is not the
 passphrase, but it IS the KDF-wrapped master key plus every keyslot — with
@@ -127,6 +136,53 @@ CI proof that both backends actually agree.
 imports = [ inputs.nixluks.systemManagerModules.default ];
 ```
 
+Two things genuinely differ on that backend, and nixluks handles both explicitly
+rather than pretending the file is backend-blind:
+
+**The host's own `cryptsetup`.** The crypttab nixluks writes is not read by
+anything in the Nix store — it is read by the HOST's
+`systemd-cryptsetup-generator`, and the units it generates run the host's own
+`/usr/bin/systemd-cryptsetup`. On NixOS that arrives with the system's systemd
+and nothing has to ask for it; on Arch it is an ordinary package that can be
+absent, or present only as some other package's undeclared dependency — which is
+not a declaration. So nixluks **publishes** the names it needs and the consumer
+**connects** them to whatever installer that host uses:
+
+```nix
+nixarch.packages.pacman = config.nixluks.archPackages; # ⇒ [ "cryptsetup" ]
+nixarch.packages.aur    = config.nixluks.aurPackages;  # ⇒ [ ] (nothing here lives in the AUR)
+```
+
+Nothing in this flake references any reconciler; both lists are plain strings,
+and both are empty on a host where nixluks is off or declares no volume.
+
+**`/etc/crypttab` is claimed only when nixluks actually owns an unlock** — i.e.
+when at least one volume has `manageUnlock = true`. A host that declares its
+volumes purely so their headers get backed up and their live shape verified
+writes no crypttab at all. An empty one is a no-op on NixOS, but on a foreign
+host `/etc/crypttab` is a real, pre-existing, distro-owned file that may already
+carry that machine's root and swap unlock lines, and `environment.etc` replaces
+a file wholesale rather than appending to it.
+
+## TPM2: tooling, never enrollment
+
+```nix
+nixluks.tpm2.installTooling = true; # tpm2-tools on PATH. Enrolls NOTHING.
+```
+
+Deciding to TPM-seal a volume is a deliberate act performed by hand, at a
+keyboard, against a specific device — and it needs `tpm2_getcap` /
+`tpm2_pcrread` available *first*, to read what the machine's TPM and PCR state
+actually are before anything is sealed to them. This option makes that tooling
+available and does nothing else: no key slot is added, removed, changed or read,
+and `systemd-cryptenroll` is never invoked.
+
+That is not a promise this README makes — `cryptenroll`, `luksChangeKey`,
+`luksConvertKey` and `reencrypt` sit in the same source-text check as
+`luksFormat` and `luksAddKey` (see "The security model" above), and a further
+test asserts that turning this option on changes the package set and *nothing*
+else: byte-identical rendered unit commands, byte-identical crypttab.
+
 ## Usage
 
 ```nix
@@ -191,9 +247,10 @@ fileSystems."/data" = {
 ## Status
 
 The module and its three tools are complete, exported for both NixOS and
-system-manager, and covered by eval-time tests (including backend parity and
-a mechanical check that the module's own code contains no
-destructive/creating cryptsetup call) plus a real `pkgs.testers.nixosTest`
+system-manager, and covered by eval-time tests (including backend parity, a
+mechanical check that the module's own code contains no destructive/creating
+cryptsetup or enrolling call, and a check that `/etc/crypttab` is claimed only
+when nixluks actually owns an unlock) plus a real `pkgs.testers.nixosTest`
 runtime harness (`checks/lifecycle-vm-test.nix`) that opens two real LUKS2
 volumes from one passphrase prompt, proves the second opens from the kernel
 keyring cache with no second prompt, proves a wrong passphrase fails cleanly,
