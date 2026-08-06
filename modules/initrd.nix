@@ -16,9 +16,8 @@
 # declared `order`, so the FIRST passphrase entered is cached in the kernel keyring and opens
 # every later member silently), run ONE STAGE EARLIER: `boot.initrd.luks.devices` instead of
 # `environment.etc."crypttab"`, `boot.initrd.systemd.services` instead of `systemd.services`.
-# Generalised from nixnas's own `modules/store/location.nix` (see that file's own header for the
-# field-proven design this lifts, and modules/boot/disk.nix for the incident every timeout choice
-# below exists to close) -- nixnas runs this today, unextracted, for its hot-mode MAIN hosts.
+# Generalised from nixnas's own `modules/store/location.nix`. Timeout policy is
+# declared per consumer; this public mechanism carries no host-specific value.
 #
 # BOOT-CRITICAL vs DATA, never conflated: a volume declaring `initrdUnlock.critical = true` gets
 # an INFINITE device-timeout (`x-systemd.device-timeout=0`) -- a missing/failed unlock correctly

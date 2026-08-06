@@ -6,13 +6,12 @@
 # from "these ciphertexts exist" to "they are open, their headers are backed up somewhere private,
 # and a live drift in what they actually are gets caught instead of discovered during a recovery".
 #
-# THIS IS AN EXTRACTION. The serial-unlock-with-keyring-cache mechanism below is lifted, not
-# reinvented, from nixnas's modules/storage/connect.nix (`storage.unlock`), generalised so any
+# The serial-unlock-with-keyring-cache mechanism below was generalised from
+# nixnas's modules/storage/connect.nix (`storage.unlock`) so any
 # host -- an ordinary machine, a disaster-recovery vault, a rescue image -- can declare the same chain
 # without depending on nixnas's appliance-specific USB/hot-store machinery. Read that file's own
-# header for the field-proven design this one lifts out; what follows restates it in
-# host-agnostic terms and adds header-backup orchestration and drift verification, which did not
-# exist anywhere before this repo.
+# header for the source mechanism; what follows restates it in host-agnostic
+# terms and adds header-backup orchestration and drift verification.
 #
 # THE MECHANISM, restated in connect.nix's own words: each declared volume opens SERIALLY via
 # `systemd-cryptsetup@<name>.service` (systemd's own crypttab-generator units); the FIRST
@@ -132,8 +131,15 @@
 #   NOT   : what goes INSIDE an unlocked volume, or how its contents are assembled, staged, or
 #           committed -- that is nixvault's domain when the volume in question is a vault. A vault
 #           is not a special case nixluks needs to know about: it is just another member of
-#           `volumes`, keyed the same as any other disk, unlocked by the same chain. nixluks owns
-#           the KEYING; nixvault owns the CONTENTS.
+#           `volumes`, unlocked by the same chain. Nixluks owns the current
+#           crypto declaration/unlock/header lifecycle; nixvault owns the
+#           CONTENTS. Future create/keyslot mutation, if added, stays in
+#           nixluks behind explicit human/destruction gates.
+#   NOT   : the rescue operating system, its repair tools or its artifact --
+#           nixrescue owns those. A rescue may consume nixluks; it must not
+#           reimplement formatting, keyslots or unlock policy.
+#   NOT   : artifact publication, materialisation or activation outcomes --
+#           nixdeploy owns delivery of primary and nixrescue roles.
 #   NOT   : importing a ZFS pool, mounting a filesystem, or starting a dependent service once a
 #           volume is open -- native NixOS/system-manager `fileSystems` and `systemd.services`
 #           already do this well; gate them on `nixluks-storage.target` the same way connect.nix's
@@ -168,8 +174,9 @@
 # installer's equivalent is). On NixOS that list is simply unread, and the module keeps taking
 # `pkgs.*` from the consuming evaluation exactly as before.
 # What this module deliberately never touches is exactly what system-manager cannot do:
-# `boot.*` (no bootloader/kernel/initrd surface -- irrelevant anyway, see SCOPE above: the initrd
-# is nixboot's domain, not this module's) and `users.*` (no dedicated service account -- every
+# `boot.*` in this dual-backend file (the NixOS-only initrd implementation is
+# the separate modules/initrd.nix; nixboot owns the boot channel, not LUKS
+# members) and `users.*` (no dedicated service account -- every
 # `nixluks-*` tool runs as whoever invokes it, root for the ones that touch a real device node,
 # same as a bare `cryptsetup` command would need). Nothing in nixluks's actual job -- reading and
 # writing crypttab entries, a handful of systemd units, and a few shell tools -- ever needed

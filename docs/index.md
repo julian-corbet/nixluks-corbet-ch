@@ -2,12 +2,11 @@
 
 ## The mechanism, restated in full
 
-This module is an extraction, not an invention. The serial-unlock-with-
-keyring-cache mechanism is lifted directly from the sibling
+The serial-unlock-with-keyring-cache mechanism was generalised from the sibling
 [nixnas](https://github.com/julian-corbet/nixnas) project's
-`modules/storage/connect.nix` (`storage.unlock`), which has run in
-production against real disks. What follows restates that design in
-host-agnostic terms.
+`modules/storage/connect.nix` (`storage.unlock`). What follows states the
+mechanism in host-agnostic terms without carrying a deployment identity or
+policy value into this public repository.
 
 Each declared volume in `nixluks.volumes` opens via
 `systemd-cryptsetup@<name>.service` — a unit systemd's own crypttab
@@ -120,6 +119,12 @@ module's own knowledge entirely, and confirms `nixluks-verify` reports
 exactly that drift.
 
 ## What is deliberately not here
+
+Volume creation, keyslot enrollment/rotation and re-encryption are not
+implemented today. If they are added, they remain nixluks responsibilities
+and must be explicitly human/destruction-gated. Nixvault owns encrypted
+content, nixrescue owns rescue-system content, and nixdeploy owns delivery;
+none is a fallback owner for missing crypto lifecycle operations.
 
 No ZFS pool import, no filesystem mount, no dependent-service wiring beyond
 naming the target they should gate on. `connect.nix`'s own appliance

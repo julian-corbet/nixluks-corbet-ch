@@ -14,8 +14,7 @@ passphrase across all of them; a `cryptsetup luksHeaderBackup` nobody
 remembers to run again after a key rotation; and no way to notice that a
 keyslot got added by hand, or that a rotation only half-happened, until a
 recovery is already underway. nixluks is the declared, generalised version of
-the first of these three things — a mechanism that already existed,
-field-proven, in the sibling
+the first of these three things — a mechanism previously carried in the sibling
 [nixnas](https://github.com/julian-corbet/nixnas) project's own
 appliance-specific storage-unlock code — plus the two that never existed
 anywhere before this repo.
@@ -56,6 +55,13 @@ not just a comment to trust — `checks/default.nix`'s own
 build if a destructive/creating cryptsetup or filesystem call (`luksFormat`,
 `luksAddKey`, `wipefs`, `mkfs.`, …) ever appears in its real code, comments
 and option prose excluded.
+
+This is the **current implementation boundary**, not an invitation for a
+neighbouring repo to own the missing crypto lifecycle. If helpers for volume
+creation, enrollment, rotation or re-encryption are added later, they belong
+in nixluks behind explicit human/destruction gates. They do not belong in
+nixvault, nixrescue, a device-class module, or a delivery engine. Today those
+mutations are intentionally unimplemented here.
 
 **Enrollment is on the far side of that line too.** `systemd-cryptenroll` —
 TPM2, FIDO2, recovery keys, any of it — WRITES a key slot, which is the same
@@ -108,11 +114,22 @@ on demand.
   separate declarations, never one module doing all three.
 - **vs [nixvault](https://github.com/julian-corbet/nixvault-corbet-ch)**:
   nixvault owns what goes INSIDE a vault, and how its contents are staged and
-  committed. nixluks owns the KEYING — a vault is not a special case this
-  module needs to know about, it is just another member of `volumes`, keyed
-  and unlocked the same as any other declared disk. A mounted vault is also
+  committed. Nixluks owns the crypto lifecycle boundary: currently the
+  declaration, unlock, header backup and verification, and exclusively any
+  future human-gated create/keyslot operations. A vault is not a special case
+  this module needs to know about; it is another declared volume. A mounted vault is also
   exactly the kind of place `headerBackup.destination` belongs: private,
   already encrypted, already part of the same recovery story.
+- **vs [nixrescue](https://github.com/julian-corbet/nixrescue-corbet-ch)**:
+  nixrescue owns the rescue operating system, repair-tool selection and rescue
+  artifact content. A rescue configuration may compose nixluks to inspect or
+  unlock a declared volume, but it must not grow a second LUKS formatter,
+  keyslot manager or unlock policy. Rescue is a consumer of the crypto
+  mechanism, never its owner.
+- **vs nixdeploy**: nixdeploy may deliver the primary or nixrescue role that
+  contains these tools. It does not create, key or unlock storage as part of
+  artifact delivery, and a successful deployment is not evidence that an
+  encrypted volume was opened or verified.
 
 ## Two backends, one file
 
@@ -246,7 +263,7 @@ fileSystems."/data" = {
 
 ## Status
 
-The module and its three tools are complete, exported for both NixOS and
+The current unlock/header-management module and its three tools are complete, exported for both NixOS and
 system-manager, and covered by eval-time tests (including backend parity, a
 mechanical check that the module's own code contains no destructive/creating
 cryptsetup or enrolling call, and a check that `/etc/crypttab` is claimed only
@@ -256,6 +273,9 @@ volumes from one passphrase prompt, proves the second opens from the kernel
 keyring cache with no second prompt, proves a wrong passphrase fails cleanly,
 proves `nixluks-verify` catches a hand-added keyslot with a different KDF,
 and proves a header backup is a real, independently readable LUKS2 header.
+Volume creation, keyslot enrollment/rotation and re-encryption are not
+implemented; the ownership rule above reserves that domain for nixluks rather
+than implying it has already shipped.
 
 ## Repository layout
 
@@ -273,7 +293,7 @@ and proves a header backup is a real, independently readable LUKS2 header.
 ## Related projects
 
 Part of the same small, independently-usable NixOS module family:
-[nixnas](https://github.com/julian-corbet/nixnas) (the field-proven
+[nixnas](https://github.com/julian-corbet/nixnas) (the
 serial-unlock-with-keyring-cache mechanism this module generalises out of its
 `modules/storage/connect.nix`), [nixvault](https://github.com/julian-corbet/nixvault-corbet-ch)
 (the VM-test pattern this project's own `checks/lifecycle-vm-test.nix`
